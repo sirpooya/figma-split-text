@@ -16,10 +16,7 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "@figma/plugin-typings": "^1.88.0",
+    "@figma/plugin-typings": "^1.124.0",
     "typescript": "^5.0.0"
   }
 }
-
-
-

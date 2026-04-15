@@ -5,6 +5,130 @@ function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+type RangeRect = { x: number; y: number; width?: number; height?: number };
+
+/** Map a vector from the text node's local space to a delta in its parent's space (rotation / scale only). */
+function localDeltaToParent(node: SceneNode, lx: number, ly: number): { x: number; y: number } {
+  const t = node.relativeTransform;
+  return {
+    x: t[0][0] * lx + t[0][1] * ly,
+    y: t[1][0] * lx + t[1][1] * ly,
+  };
+}
+
+function estimateLineHeightPx(node: TextNode, charIndex: number): number {
+  const len = node.characters.length;
+  const end = Math.min(charIndex + 1, len);
+  if (charIndex >= len) {
+    return typeof node.fontSize === 'number' ? node.fontSize * 1.2 : 16;
+  }
+  const lh = node.getRangeLineHeight(charIndex, end);
+  if (lh !== figma.mixed && lh.unit === 'PIXELS') {
+    return lh.value;
+  }
+  if (lh !== figma.mixed && lh.unit === 'PERCENT') {
+    const fs = node.getRangeFontSize(charIndex, end);
+    const fz = typeof fs === 'number' ? fs : (node.fontSize as number);
+    return (lh.value / 100) * fz;
+  }
+  const fs = node.getRangeFontSize(charIndex, end);
+  const fz = typeof fs === 'number' ? fs : (node.fontSize as number);
+  return fz * 1.2;
+}
+
+/**
+ * Use a runtime API if Figma exposes one (not always present in typings).
+ * Rect is assumed to be in the text node's local coordinate space (origin = layer top-left).
+ */
+function tryNativeRangeRect(node: TextNode, start: number, end: number): RangeRect | null {
+  const n = node as TextNode & {
+    getRangeBoundingBox?: (s: number, e: number) => RangeRect;
+    getRangeBounds?: (s: number, e: number) => RangeRect;
+  };
+  for (const method of ['getRangeBoundingBox', 'getRangeBounds'] as const) {
+    const fn = n[method];
+    if (typeof fn === 'function') {
+      try {
+        const r = fn.call(n, start, end);
+        if (r && typeof r.x === 'number' && typeof r.y === 'number') {
+          return r;
+        }
+      } catch (_e) {
+        /* continue */
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Approximate (lx, ly) for the start of a character range using a hidden clone.
+ * Accurate for LEFT- or JUSTIFIED-aligned text; line Y uses newline count × line height.
+ */
+function getSegmentLocalOffsetViaClone(source: TextNode, partStartIndex: number): { lx: number; ly: number } {
+  const chars = source.characters;
+  const prefix = chars.slice(0, partStartIndex);
+  const lineStarts = prefix.lastIndexOf('\n') + 1;
+  const lineCount = (prefix.match(/\n/g) || []).length;
+  const lh = estimateLineHeightPx(source, partStartIndex);
+
+  const probe = source.clone();
+  probe.visible = false;
+  figma.currentPage.appendChild(probe);
+  try {
+    probe.deleteCharacters(partStartIndex, chars.length);
+    probe.deleteCharacters(0, lineStarts);
+    probe.textAutoResize = 'WIDTH_AND_HEIGHT';
+    const dx = probe.width;
+    const dy = lineCount * lh;
+    return { lx: dx, ly: dy };
+  } finally {
+    probe.remove();
+  }
+}
+
+function applyPreservedSegmentPosition(
+  source: TextNode,
+  newNode: TextNode,
+  partStartIndex: number,
+  partEndIndex: number,
+  originalX: number,
+  originalY: number,
+  stackVertically: boolean,
+  fallbackY: number,
+): void {
+  if (stackVertically) {
+    newNode.x = originalX;
+    newNode.y = fallbackY;
+    return;
+  }
+
+  const native = tryNativeRangeRect(source, partStartIndex, partEndIndex);
+  if (native) {
+    const d = localDeltaToParent(source, native.x, native.y);
+    newNode.x = originalX + d.x;
+    newNode.y = originalY + d.y;
+    newNode.textAlignHorizontal = 'LEFT';
+    newNode.textAlignVertical = 'TOP';
+    return;
+  }
+
+  const align = source.textAlignHorizontal;
+  const useWidthProbe = align === 'LEFT' || align === 'JUSTIFIED';
+  if (useWidthProbe) {
+    const off = getSegmentLocalOffsetViaClone(source, partStartIndex);
+    const d = localDeltaToParent(source, off.lx, off.ly);
+    newNode.x = originalX + d.x;
+    newNode.y = originalY + d.y;
+    newNode.textAlignHorizontal = 'LEFT';
+    newNode.textAlignVertical = 'TOP';
+    return;
+  }
+
+  newNode.x = originalX;
+  newNode.y = fallbackY;
+}
+
 // Extract split logic into a reusable function
 async function performSplit(delimiter: string, wrapInAutoLayout: boolean, stackVertically: boolean = false, isLineSplit: boolean = false) {
   // Allow space and newline characters as valid delimiters
@@ -180,6 +304,7 @@ async function performSplit(delimiter: string, wrapInAutoLayout: boolean, stackV
           newNode.textStyleId = partTextStyle;
         }
         
+        const partEndIndex = partStartIndex + part.length;
         currentTextIndex += part.length + delimiter.length;
         
         // Apply styling properties
@@ -196,9 +321,16 @@ async function performSplit(delimiter: string, wrapInAutoLayout: boolean, stackV
           newNode.lineHeight = lineHeight;
         }
         
-        // Position the new node
-        newNode.x = originalX;
-        newNode.y = currentY;
+        applyPreservedSegmentPosition(
+          textNode,
+          newNode,
+          partStartIndex,
+          partEndIndex,
+          originalX,
+          originalY,
+          stackVertically,
+          currentY,
+        );
         
         // If stacking vertically (for split by line), increment Y position by text height
         if (stackVertically) {
