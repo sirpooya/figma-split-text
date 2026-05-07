@@ -132,7 +132,8 @@ function applyPreservedSegmentPosition(
 // Extract split logic into a reusable function
 async function performSplit(delimiter: string, wrapInAutoLayout: boolean, stackVertically: boolean = false, isLineSplit: boolean = false) {
   // Allow space and newline characters as valid delimiters
-  if (!delimiter || delimiter.length === 0) {
+  // Check for null/undefined, but allow empty string and space character as valid delimiters
+  if (delimiter === null || delimiter === undefined) {
     figma.notify('Please enter a delimiter');
     return;
   }
